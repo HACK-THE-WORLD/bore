@@ -27,6 +27,8 @@ struct SocksAuth {
     password: String,
 }
 
+type ClientRequestTx = mpsc::UnboundedSender<(Uuid, TargetAddr)>;
+
 /// State structure for the server.
 pub struct Server {
     /// TCP port where the SOCKS5 proxy will listen.
@@ -42,7 +44,7 @@ pub struct Server {
     conns: Arc<DashMap<Uuid, PendingConnection>>,
 
     /// Currently registered network egress client.
-    client_tx: Arc<Mutex<Option<mpsc::UnboundedSender<(Uuid, TargetAddr)>>>>,
+    client_tx: Arc<Mutex<Option<ClientRequestTx>>>,
 
     /// Queue of SOCKS5 requests waiting for a registered client.
     pending: Arc<Mutex<VecDeque<(Uuid, TargetAddr)>>>,

@@ -14,14 +14,15 @@ required_arg $TARGET_TRIPLE '<Target Triple>'
 
 max_attempts=3
 count=0
+status=1
 
 while [ $count -lt $max_attempts ]; do
-    $CROSS test --target $TARGET_TRIPLE
-    status=$?
-    if [ $status -eq 0 ]; then
+    if $CROSS test --target $TARGET_TRIPLE; then
         echo "Test passed"
+        status=0
         break
     else
+        status=$?
         echo "Test failed, attempt $(($count + 1))"
     fi
     count=$(($count + 1))
@@ -30,3 +31,5 @@ done
 if [ $status -ne 0 ]; then
     echo "Test failed after $max_attempts attempts"
 fi
+
+exit $status
