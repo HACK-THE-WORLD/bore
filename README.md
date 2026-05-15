@@ -1,160 +1,107 @@
 # bore
 
-[![Build status](https://img.shields.io/github/actions/workflow/status/ekzhang/bore/ci.yml)](https://github.com/ekzhang/bore/actions)
-[![Crates.io](https://img.shields.io/crates/v/bore-cli.svg)](https://crates.io/crates/bore-cli)
+A reverse SOCKS5 proxy built from the original `bore` tunnel. It lets a remote server expose a SOCKS5 port while all outbound network connections are made from the client machine's network environment.
 
-A modern, simple TCP tunnel in Rust that exposes local ports to a remote server, bypassing standard NAT connection firewalls. **That's all it does: no more, and no less.**
+This is useful when you want tools on the server side to browse through the client's network, instead of forwarding one fixed local port.
 
-![Video demo](https://i.imgur.com/vDeGsmx.gif)
+## Usage
+
+Run the server on the public machine:
 
 ```shell
-# Installation (requires Rust, see alternatives below)
-cargo install bore-cli
-
-# On your local machine
-bore local 8000 --to bore.pub
+bore server --socks-port 1080 --secret my_secret_string
 ```
 
-This will expose your local port at `localhost:8000` to the public internet at `bore.pub:<PORT>`, where the port number is assigned randomly.
-
-Similar to [localtunnel](https://github.com/localtunnel/localtunnel) and [ngrok](https://ngrok.io/), except `bore` is intended to be a highly efficient, unopinionated tool for forwarding TCP traffic that is simple to install and easy to self-host, with no frills attached.
-
-(`bore` totals about 400 lines of safe, async Rust code and is trivial to set up — just run a single binary for the client and server.)
-
-## Installation
-
-### macOS
-
-`bore` is packaged as a Homebrew core formula.
+If you also want to protect the public SOCKS5 entrance itself, add username/password authentication:
 
 ```shell
-brew install bore-cli
+bore server --socks-port 1080 --secret my_secret_string --socks-username user --socks-password pass
 ```
 
-### Linux
-
-#### Arch Linux
-
-`bore` is available in the AUR as `bore`.
+Run the client inside the network environment you want to reuse:
 
 ```shell
-yay -S bore # or your favorite AUR helper
+bore local --to <SERVER_ADDRESS> --secret my_secret_string
 ```
 
-#### Gentoo Linux
-
-`bore` is available in the [gentoo-zh](https://github.com/microcai/gentoo-zh) overlay.
+Then configure applications to use the server as a SOCKS5 proxy:
 
 ```shell
-sudo eselect repository enable gentoo-zh
-sudo emerge --sync gentoo-zh
-sudo emerge net-proxy/bore
+curl --socks5-hostname <SERVER_ADDRESS>:1080 https://example.com
 ```
 
-### Binary Distribution
-
-Otherwise, the easiest way to install bore is from prebuilt binaries. These are available on the [releases page](https://github.com/ekzhang/bore/releases) for macOS, Windows, and Linux. Just unzip the appropriate file for your platform and move the `bore` executable into a folder on your PATH.
-
-### Cargo
-
-You also can build `bore` from source using [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager. This command installs the `bore` binary at a user-accessible path.
+With SOCKS5 username/password enabled:
 
 ```shell
-cargo install bore-cli
+curl --proxy socks5h://user:pass@<SERVER_ADDRESS>:1080 https://example.com
 ```
 
-### Docker
+The destination connection is created by the client machine. DNS names are also sent through the SOCKS5 request when the application uses SOCKS5 hostname mode, such as `curl --socks5-hostname`.
 
-We also publish versioned Docker images for each release. The image is built for an AMD 64-bit architecture. They're tagged with the specific version and allow you to run the statically-linked `bore` binary from a minimal "scratch" container.
+If the client itself must reach the server through an HTTP or HTTPS proxy, pass `--proxy <URL>` or set `BORE_PROXY`:
 
 ```shell
-docker run -it --init --rm --network host ekzhang/bore <ARGS>
+bore local --to <SERVER_ADDRESS> --secret my_secret_string --proxy http://127.0.0.1:8080
+bore local --to <SERVER_ADDRESS> --secret my_secret_string --proxy https://proxy.example.com:443
 ```
 
-## Detailed Usage
+`--proxy` only affects the client's connection to the bore server control port. Users of the remote SOCKS5 proxy still connect to `<SERVER_ADDRESS>:1080`.
 
-This section describes detailed usage for the `bore` CLI command.
+## Commands
 
-### Local Forwarding
-
-You can forward a port on your local machine by using the `bore local` command. This takes a positional argument, the local port to forward, as well as a mandatory `--to` option, which specifies the address of the remote server.
+### Client
 
 ```shell
-bore local 5000 --to bore.pub
+bore local --to <SERVER_ADDRESS> [OPTIONS]
 ```
-
-You can optionally pass in a `--port` option to pick a specific port on the remote to expose, although the command will fail if this port is not available. Also, passing `--local-host` allows you to expose a different host on your local area network besides the loopback address `localhost`.
-
-The full options are shown below.
-
-```shell
-Starts a local proxy to the remote server
-
-Usage: bore local [OPTIONS] --to <TO> <LOCAL_PORT>
-
-Arguments:
-  <LOCAL_PORT>  The local port to expose [env: BORE_LOCAL_PORT=]
 
 Options:
-  -l, --local-host <HOST>  The local host to expose [default: localhost]
-  -t, --to <TO>            Address of the remote server to expose local ports to [env: BORE_SERVER=]
-  -p, --port <PORT>        Optional port on the remote server to select [default: 0]
-  -s, --secret <SECRET>    Optional secret for authentication [env: BORE_SECRET]
-  -h, --help               Print help
-```
-
-### Self-Hosting
-
-As mentioned in the startup instructions, there is a public instance of the `bore` server running at `bore.pub`. However, if you want to self-host `bore` on your own network, you can do so with the following command:
 
 ```shell
-bore server
+  -t, --to <TO>          Address of the remote server [env: BORE_SERVER=]
+  -s, --secret <SECRET>  Optional secret for authentication [env: BORE_SECRET]
+      --proxy <PROXY>    Optional HTTP(S) proxy URL for connecting to the remote server [env: BORE_PROXY=]
+  -h, --help             Print help
 ```
 
-That's all it takes! After the server starts running at a given address, you can then update the `bore local` command with option `--to <ADDRESS>` to forward a local port to this remote server.
-
-It's possible to specify different IP addresses for the control server and for the tunnels. This setup is useful for cases where you might want the control server to be on a private network while allowing tunnel connections over a public interface, or vice versa.
-
-The full options for the `bore server` command are shown below.
+### Server
 
 ```shell
-Runs the remote proxy server
-
-Usage: bore server [OPTIONS]
+bore server [OPTIONS]
+```
 
 Options:
-      --min-port <MIN_PORT>          Minimum accepted TCP port number [env: BORE_MIN_PORT=] [default: 1024]
-      --max-port <MAX_PORT>          Maximum accepted TCP port number [env: BORE_MAX_PORT=] [default: 65535]
-  -s, --secret <SECRET>              Optional secret for authentication [env: BORE_SECRET]
-      --bind-addr <BIND_ADDR>        IP address to bind to, clients must reach this [default: 0.0.0.0]
-      --bind-tunnels <BIND_TUNNELS>  IP address where tunnels will listen on, defaults to --bind-addr
-  -h, --help                         Print help
+
+```shell
+      --socks-port <SOCKS_PORT>  TCP port where the SOCKS5 proxy listens [env: BORE_SOCKS_PORT=] [default: 1080]
+  -s, --secret <SECRET>          Optional secret for authentication [env: BORE_SECRET]
+        --socks-username <SOCKS_USERNAME>
+                     Optional username required by the public SOCKS5 listener [env: BORE_SOCKS_USERNAME=]
+        --socks-password <SOCKS_PASSWORD>
+                     Optional password required by the public SOCKS5 listener [env: BORE_SOCKS_PASSWORD=]
+      --bind-addr <BIND_ADDR>    IP address for the control server [default: 0.0.0.0]
+      --bind-socks <BIND_SOCKS>  IP address where the SOCKS5 proxy listens, defaults to --bind-addr
+  -h, --help                     Print help
 ```
+
+The control server listens on TCP port `7835`. The SOCKS5 proxy listens on `--socks-port`.
 
 ## Protocol
 
-There is an implicit _control port_ at `7835`, used for creating new connections on demand. At initialization, the client sends a "Hello" message to the server on the TCP control port, asking to proxy a selected remote port. The server then responds with an acknowledgement and begins listening for external TCP connections.
-
-Whenever the server obtains a connection on the remote port, it generates a secure [UUID](https://en.wikipedia.org/wiki/Universally_unique_identifier) for that connection and sends it back to the client. The client then opens a separate TCP stream to the server and sends an "Accept" message containing the UUID on that stream. The server then proxies the two connections between each other.
-
-For correctness reasons and to avoid memory leaks, incoming connections are only stored by the server for up to 10 seconds before being discarded if the client does not accept them.
+The client keeps a control connection to the server on port `7835`. The server exposes a SOCKS5 listener. For each SOCKS5 `CONNECT` request, the server sends the requested target host and port to the client over the control connection. The client opens a new connection back to the control server, accepts that request ID, dials the target from the client's network, and the two streams are copied bidirectionally.
 
 ## Authentication
 
-On a custom deployment of `bore server`, you can optionally require a _secret_ to prevent the server from being used by others. The protocol requires clients to verify possession of the secret on each TCP connection by answering random challenges in the form of HMAC codes. (This secret is only used for the initial handshake, and no further traffic is encrypted by default.)
+On a custom deployment, use `--secret` to require clients to authenticate. The protocol verifies possession of the secret on every control connection by answering random HMAC challenges.
 
-```shell
-# on the server
-bore server --secret my_secret_string
+If the public SOCKS5 endpoint should not be anonymous, set `--socks-username` and `--socks-password`. This enables the SOCKS5 username/password method defined by RFC 1929.
 
-# on the client
-bore local <LOCAL_PORT> --to <TO> --secret my_secret_string
-```
+The proxied TCP traffic is not encrypted by this tool unless the application protocol itself uses encryption, such as HTTPS or SSH.
 
-If a secret is not present in the arguments, `bore` will also attempt to read from the `BORE_SECRET` environment variable.
+## Notes
 
-## Acknowledgements
+This implements a TCP SOCKS5 proxy, not a full layer-3 VPN. Applications must support SOCKS5 directly or be wrapped with a tool that can route TCP traffic through a SOCKS5 proxy. UDP ASSOCIATE and BIND are not supported.
 
-Created by Eric Zhang ([@ekzhang1](https://twitter.com/ekzhang1)). Licensed under the [MIT license](LICENSE).
+## License
 
-The author would like to thank the contributors and maintainers of the [Tokio](https://tokio.rs/) project for making it possible to write ergonomic and efficient network services in Rust.
+Licensed under the [MIT license](LICENSE).
