@@ -148,7 +148,11 @@ async fn mismatched_secret(
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(server_secret, None).await.expect("server should start"));
+    tasks.push(
+        spawn_server(server_secret, None)
+            .await
+            .expect("server should start"),
+    );
     assert!(spawn_client(client_secret).await.is_err());
 }
 
@@ -195,7 +199,8 @@ async fn socks_authentication_rejects_missing_or_invalid_credentials() -> Result
     no_auth.read_exact(&mut response).await?;
     assert_eq!(response, [0x05, 0xff]);
 
-    let mut wrong_auth = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, TEST_SOCKS_PORT)).await?;
+    let mut wrong_auth =
+        TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, TEST_SOCKS_PORT)).await?;
     wrong_auth.write_all(&[0x05, 0x01, 0x02]).await?;
     wrong_auth.read_exact(&mut response).await?;
     assert_eq!(response, [0x05, 0x02]);
@@ -244,6 +249,56 @@ async fn very_long_frame() -> Result<()> {
         time::sleep(Duration::from_millis(10)).await;
     }
     panic!("did not exit after a 1 MB frame");
+}
+
+#[tokio::test]
+async fn multiple_clients_round_robin() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let mut tasks = TestTasks::default();
+
+    tasks.push(spawn_server(None, None).await?);
+    // Register two egress clients.
+    tasks.push(spawn_client(None).await?);
+    tasks.push(spawn_client(None).await?);
+    // Give the server a moment to register both clients.
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Spin up two distinct echo targets so each connection can be matched
+    // back to whichever client served it.
+    let listener_a = TcpListener::bind("localhost:0").await?;
+    let listener_b = TcpListener::bind("localhost:0").await?;
+    let target_a = listener_a.local_addr()?;
+    let target_b = listener_b.local_addr()?;
+
+    for listener in [listener_a, listener_b] {
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await?;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    if stream.read_exact(&mut buf).await.is_ok() {
+                        let _ = stream.write_all(&buf).await;
+                    }
+                    anyhow::Ok(())
+                });
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+    }
+
+    // Issue 6 sequential SOCKS5 requests; each should succeed regardless of
+    // which client is selected. We just verify the proxy keeps serving.
+    let proxy_addr = ([127, 0, 0, 1], TEST_SOCKS_PORT).into();
+    for target in [target_a, target_b, target_a, target_b, target_a, target_b] {
+        let mut stream = socks5_connect(proxy_addr, target, None).await?;
+        stream.write_all(b"ping").await?;
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"ping");
+    }
+
+    Ok(())
 }
 
 #[tokio::test]

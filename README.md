@@ -38,12 +38,25 @@ curl --proxy socks5h://user:pass@<SERVER_ADDRESS>:1080 https://example.com
 
 The destination connection is created by the client machine. DNS names are also sent through the SOCKS5 request when the application uses SOCKS5 hostname mode, such as `curl --socks5-hostname`.
 
-If the client itself must reach the server through an HTTP or HTTPS proxy, pass `--proxy <URL>` or set `BORE_PROXY`:
+If the client itself must reach the server through a proxy, pass `--proxy <URL>` or set `BORE_PROXY`:
 
 ```shell
+# HTTP / HTTPS CONNECT proxy
 bore local --to <SERVER_ADDRESS> --secret my_secret_string --proxy http://127.0.0.1:8080
 bore local --to <SERVER_ADDRESS> --secret my_secret_string --proxy https://proxy.example.com:443
+
+# SOCKS5 proxy (recommended for forwarding WebSocket / long-lived traffic)
+bore local --to <SERVER_ADDRESS> --secret my_secret_string --proxy socks5://proxy.example.com:1080
+bore local --to <SERVER_ADDRESS> --secret my_secret_string --proxy socks5h://user:pass@proxy.example.com:1080
 ```
+
+Supported schemes:
+
+- `http://host:port` and `https://host:port` use HTTP `CONNECT`. No proxy authentication.
+- `socks5://[user:pass@]host:port` resolves the destination DNS locally.
+- `socks5h://[user:pass@]host:port` defers DNS resolution to the SOCKS5 proxy. This is preferred when the client cannot resolve the bore server's hostname directly.
+
+`--proxy` is used both for the long-lived control connection and for the per-request data connections, so the client only needs outbound access through the proxy. SOCKS5 is recommended if you forward WebSocket or other long-lived traffic, because HTTP CONNECT proxies often impose aggressive idle timeouts on tunnels.
 
 `--proxy` only affects the client's connection to the bore server control port. Users of the remote SOCKS5 proxy still connect to `<SERVER_ADDRESS>:1080`.
 
@@ -89,6 +102,18 @@ The control server listens on TCP port `7835`. The SOCKS5 proxy listens on `--so
 ## Protocol
 
 The client keeps a control connection to the server on port `7835`. The server exposes a SOCKS5 listener. For each SOCKS5 `CONNECT` request, the server sends the requested target host and port to the client over the control connection. The client opens a new connection back to the control server, accepts that request ID, dials the target from the client's network, and the two streams are copied bidirectionally.
+
+### Multiple clients
+
+Multiple bore clients can register against the same server. Incoming SOCKS5 requests are dispatched across registered clients in round-robin order; if a client disconnects mid-flight its slot is removed automatically. If no clients are connected, requests are queued (up to 1024) and dispatched as soon as a client comes online.
+
+### Long-lived connections
+
+The control connection has bidirectional 15-second heartbeats and a 45-second idle timeout, so half-open connections (silent NAT timeouts, network black holes) are detected within a minute. Data connections enable `TCP_NODELAY` and TCP keepalive (30s idle / 10s probe) to keep WebSocket and other interactive long-lived flows from being silently reset by intermediate gateways.
+
+### Reconnect
+
+The client automatically reconnects to the server with exponential backoff (1s, 2s, 4s, …, capped at 30s). In-flight data connections are independent and continue to function across control-connection reconnects.
 
 ## Authentication
 

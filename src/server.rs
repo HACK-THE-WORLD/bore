@@ -2,23 +2,36 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, TargetAddr, CONTROL_PORT};
+use crate::shared::{
+    tune_tcp_stream, ClientMessage, Delimited, ServerMessage, TargetAddr, CONTROL_PORT,
+    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
+};
+
+/// Maximum number of SOCKS5 requests that can be queued while no client is
+/// registered. Beyond this, new requests are rejected immediately.
+const MAX_PENDING_REQUESTS: usize = 1024;
+
+/// How long an unaccepted SOCKS5 request stays in `conns` before it is dropped.
+const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PendingConnection {
     stream: TcpStream,
+    /// Time the request was accepted. Used to expire stale entries.
+    queued_at: Instant,
 }
 
 #[derive(Clone)]
@@ -28,6 +41,13 @@ struct SocksAuth {
 }
 
 type ClientRequestTx = mpsc::UnboundedSender<(Uuid, TargetAddr)>;
+
+/// Information about a currently registered egress client.
+struct RegisteredClient {
+    tx: ClientRequestTx,
+    /// Human-readable address for logging.
+    addr: String,
+}
 
 /// State structure for the server.
 pub struct Server {
@@ -43,8 +63,11 @@ pub struct Server {
     /// Concurrent map of IDs to incoming SOCKS5 connections.
     conns: Arc<DashMap<Uuid, PendingConnection>>,
 
-    /// Currently registered network egress client.
-    client_tx: Arc<Mutex<Option<ClientRequestTx>>>,
+    /// All currently registered network egress clients, keyed by client id.
+    clients: Arc<DashMap<Uuid, RegisteredClient>>,
+
+    /// Round-robin counter used to dispatch requests across clients.
+    rr_counter: Arc<AtomicUsize>,
 
     /// Queue of SOCKS5 requests waiting for a registered client.
     pending: Arc<Mutex<VecDeque<(Uuid, TargetAddr)>>>,
@@ -62,7 +85,8 @@ impl Server {
         Server {
             socks_port,
             conns: Arc::new(DashMap::new()),
-            client_tx: Arc::new(Mutex::new(None)),
+            clients: Arc::new(DashMap::new()),
+            rr_counter: Arc::new(AtomicUsize::new(0)),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             auth: secret.map(Authenticator::new),
             socks_auth: None,
@@ -103,16 +127,38 @@ impl Server {
             }
         });
 
+        // Periodic janitor: drop stale `conns` entries whose client never
+        // returned an Accept in time.
+        let janitor = Arc::clone(&this);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let now = Instant::now();
+                janitor.conns.retain(|id, pending| {
+                    let keep = now.duration_since(pending.queued_at) < PENDING_REQUEST_TIMEOUT;
+                    if !keep {
+                        warn!(%id, "removed stale SOCKS5 request");
+                    }
+                    keep
+                });
+            }
+        });
+
         this.listen_control(control_listener, socks_port).await
     }
 
     async fn listen_control(self: Arc<Self>, listener: TcpListener, socks_port: u16) -> Result<()> {
         loop {
             let (stream, addr) = listener.accept().await?;
+            tune_tcp_stream(&stream);
             let this = Arc::clone(&self);
             tokio::spawn(
                 async move {
-                    if let Err(err) = this.handle_control_connection(stream, socks_port).await {
+                    if let Err(err) = this
+                        .handle_control_connection(stream, addr.to_string(), socks_port)
+                        .await
+                    {
                         warn!(%err, "control connection exited with error");
                     }
                 }
@@ -124,6 +170,7 @@ impl Server {
     async fn listen_socks(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, addr) = listener.accept().await?;
+            tune_tcp_stream(&stream);
             let this = Arc::clone(&self);
             tokio::spawn(
                 async move {
@@ -147,33 +194,58 @@ impl Server {
         info!(%target.host, target.port, "new SOCKS5 request");
 
         let id = Uuid::new_v4();
-        self.conns.insert(id, PendingConnection { stream });
-        self.dispatch_request(id, target).await?;
+        let queued_at = Instant::now();
 
-        let conns = Arc::clone(&self.conns);
-        tokio::spawn(async move {
-            sleep(Duration::from_secs(10)).await;
-            if conns.remove(&id).is_some() {
-                warn!(%id, "removed stale SOCKS5 request");
+        // Try to dispatch first; only insert into `conns` if a client accepts
+        // ownership. This avoids leaking entries when no client is registered
+        // and the queue is full.
+        match self.dispatch_request(id, target.clone()).await {
+            DispatchOutcome::Sent | DispatchOutcome::Queued => {
+                self.conns
+                    .insert(id, PendingConnection { stream, queued_at });
             }
-        });
-
-        Ok(())
-    }
-
-    async fn dispatch_request(&self, id: Uuid, target: TargetAddr) -> Result<()> {
-        let mut client_tx = self.client_tx.lock().await;
-        if let Some(tx) = client_tx.as_ref() {
-            if tx.send((id, target.clone())).is_ok() {
-                return Ok(());
+            DispatchOutcome::Rejected => {
+                // Best-effort: tell the SOCKS5 user that the request failed.
+                let _ = write_socks_failure_late(&mut stream, 0x04).await;
+                warn!("rejected SOCKS5 request: queue full and no available client");
             }
-            *client_tx = None;
         }
-        self.pending.lock().await.push_back((id, target));
+
         Ok(())
     }
 
-    async fn handle_control_connection(&self, stream: TcpStream, socks_port: u16) -> Result<()> {
+    async fn dispatch_request(&self, id: Uuid, target: TargetAddr) -> DispatchOutcome {
+        // Snapshot client ids (cheap; small map). Iterate in round-robin order.
+        let ids: Vec<Uuid> = self.clients.iter().map(|e| *e.key()).collect();
+        if !ids.is_empty() {
+            let start = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+            for i in 0..ids.len() {
+                let cid = ids[(start + i) % ids.len()];
+                if let Some(client) = self.clients.get(&cid) {
+                    if client.tx.send((id, target.clone())).is_ok() {
+                        return DispatchOutcome::Sent;
+                    }
+                }
+                // Stale entry: drop it and continue.
+                self.clients.remove(&cid);
+            }
+        }
+
+        // No live clients. Queue if there is room.
+        let mut pending = self.pending.lock().await;
+        if pending.len() >= MAX_PENDING_REQUESTS {
+            return DispatchOutcome::Rejected;
+        }
+        pending.push_back((id, target));
+        DispatchOutcome::Queued
+    }
+
+    async fn handle_control_connection(
+        &self,
+        stream: TcpStream,
+        addr: String,
+        socks_port: u16,
+    ) -> Result<()> {
         let mut stream = Delimited::new(stream);
         if let Some(auth) = &self.auth {
             if let Err(err) = auth.server_handshake(&mut stream).await {
@@ -185,14 +257,23 @@ impl Server {
 
         match stream.recv_timeout().await? {
             Some(ClientMessage::Authenticate(_)) => warn!("unexpected authenticate"),
+            Some(ClientMessage::Heartbeat) => warn!("unexpected heartbeat before hello"),
             Some(ClientMessage::Hello) => {
-                info!(socks_port, "new network egress client");
+                let client_id = Uuid::new_v4();
+                info!(%client_id, socks_port, "new network egress client");
                 stream.send(ServerMessage::Hello(socks_port)).await?;
                 let (tx, rx) = mpsc::unbounded_channel();
-                {
-                    let mut client_tx = self.client_tx.lock().await;
-                    *client_tx = Some(tx.clone());
-                }
+                self.clients.insert(
+                    client_id,
+                    RegisteredClient {
+                        tx: tx.clone(),
+                        addr: addr.clone(),
+                    },
+                );
+                info!(%client_id, %addr, total = self.clients.len(), "client registered");
+
+                // Drain any pending requests that arrived before any client
+                // was connected.
                 {
                     let mut pending = self.pending.lock().await;
                     while let Some(request) = pending.pop_front() {
@@ -201,7 +282,12 @@ impl Server {
                         }
                     }
                 }
-                self.run_registered_client(stream, rx).await?;
+
+                let result = self.run_registered_client(stream, rx).await;
+                let removed = self.clients.remove(&client_id);
+                let removed_addr = removed.map(|(_, c)| c.addr).unwrap_or_default();
+                info!(%client_id, addr = %removed_addr, remaining = self.clients.len(), "client deregistered");
+                result?;
             }
             Some(ClientMessage::Accept(id)) => {
                 info!(%id, "forwarding SOCKS5 connection");
@@ -225,14 +311,41 @@ impl Server {
         mut stream: Delimited<TcpStream>,
         mut pending_rx: mpsc::UnboundedReceiver<(Uuid, TargetAddr)>,
     ) -> Result<()> {
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // Skip the initial immediate tick.
+        heartbeat.tick().await;
+
         loop {
             tokio::select! {
                 Some((id, target)) = pending_rx.recv() => {
                     if self.conns.contains_key(&id) {
-                        stream.send(ServerMessage::Connection { id, target }).await?;
+                        if let Err(err) = stream.send(ServerMessage::Connection { id, target }).await {
+                            warn!(%err, "failed to send connection request to client");
+                            return Ok(());
+                        }
                     }
                 }
-                _ = sleep(Duration::from_millis(500)) => {
+                msg = timeout(HEARTBEAT_TIMEOUT, stream.recv()) => {
+                    match msg {
+                        Ok(Ok(Some(ClientMessage::Heartbeat))) => {}
+                        Ok(Ok(Some(_))) => {
+                            warn!("unexpected message on registered client connection");
+                        }
+                        Ok(Ok(None)) => {
+                            info!("client closed control connection");
+                            return Ok(());
+                        }
+                        Ok(Err(err)) => {
+                            warn!(%err, "control connection read error");
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            warn!("client heartbeat timeout, dropping");
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
                     if stream.send(ServerMessage::Heartbeat).await.is_err() {
                         return Ok(());
                     }
@@ -240,6 +353,27 @@ impl Server {
             }
         }
     }
+}
+
+enum DispatchOutcome {
+    /// Sent directly to a registered client.
+    Sent,
+    /// No client available; queued.
+    Queued,
+    /// Rejected because the queue is full.
+    Rejected,
+}
+
+/// Write a SOCKS5 failure reply on a stream where the success reply was not
+/// yet sent. This is best-effort: errors are ignored by the caller.
+async fn write_socks_failure_late(stream: &mut TcpStream, status: u8) -> Result<()> {
+    // We have already sent 0x00 success in `socks5_handshake`, so the only way
+    // the SOCKS5 client will know about this failure is by closing the
+    // connection. Sending anything here would be interpreted as tunneled data.
+    // Just drop the stream cleanly.
+    let _ = status;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&SocksAuth>) -> Result<TargetAddr> {
@@ -321,13 +455,26 @@ async fn socks5_password_auth(stream: &mut TcpStream, auth: &SocksAuth) -> Resul
 
     let username = read_socks5_string(stream).await?;
     let password = read_socks5_string(stream).await?;
-    if username == auth.username && password == auth.password {
+    if constant_time_eq(username.as_bytes(), auth.username.as_bytes())
+        && constant_time_eq(password.as_bytes(), auth.password.as_bytes())
+    {
         stream.write_all(&[0x01, 0x00]).await?;
         Ok(())
     } else {
         stream.write_all(&[0x01, 0x01]).await?;
         bail!("invalid SOCKS5 username/password");
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn read_socks5_string(stream: &mut TcpStream) -> Result<String> {

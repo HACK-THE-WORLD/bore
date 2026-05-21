@@ -5,10 +5,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::codec::{AnyDelimiterCodec, Framed, FramedParts};
-use tracing::trace;
+use tracing::{trace, warn};
 use uuid::Uuid;
 
 /// TCP port used for control connections with the server.
@@ -21,7 +23,37 @@ pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 pub const MAX_FRAME_LENGTH: usize = 1024;
 
 /// Timeout for network connections and initial protocol messages.
-pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval between application-level heartbeats on the control connection.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Maximum time the control connection may be idle before it is considered dead.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// TCP keepalive idle period before probes are sent on data connections.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+
+/// Interval between TCP keepalive probes on data connections.
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Apply tuning to a TCP stream that carries proxied user data.
+///
+/// - Disables Nagle's algorithm so small WebSocket / interactive frames are
+///   forwarded immediately rather than batched up to ~40ms.
+/// - Enables TCP keepalive so idle connections through NAT / proxy gateways
+///   are kept alive (or quickly detected as dead).
+pub fn tune_tcp_stream(stream: &TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        warn!(%err, "failed to set TCP_NODELAY");
+    }
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    if let Err(err) = SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        warn!(%err, "failed to set TCP keepalive");
+    }
+}
 
 /// A message from the client on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +66,9 @@ pub enum ClientMessage {
 
     /// Accepts an incoming SOCKS connection, using this stream as a proxy.
     Accept(Uuid),
+
+    /// No-op used by the client to keep the control connection alive.
+    Heartbeat,
 }
 
 /// TCP target requested through the remote SOCKS5 listener.

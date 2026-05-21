@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use anyhow::{bail, Result};
 use bore_cli::{
-    client::{Client, ProxyConfig},
+    client::{run_with_reconnect, ProxyConfig},
     server::Server,
     shared::DEFAULT_SOCKS_PORT,
 };
@@ -65,8 +65,7 @@ async fn run(command: Command) -> Result<()> {
     match command {
         Command::Local { to, secret, proxy } => {
             let proxy = proxy.as_deref().map(ProxyConfig::parse).transpose()?;
-            let client = Client::new(&to, secret.as_deref(), proxy).await?;
-            client.listen().await?;
+            run_with_reconnect(to, secret, proxy).await?;
         }
         Command::Server {
             socks_port,
