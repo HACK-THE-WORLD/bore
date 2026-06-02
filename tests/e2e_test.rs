@@ -40,10 +40,14 @@ impl Drop for TestTasks {
 async fn spawn_server(
     secret: Option<&str>,
     socks_auth: Option<(&str, &str)>,
+    pending_request_timeout: Option<Duration>,
 ) -> Result<JoinHandle<Result<()>>> {
     let mut server = Server::new(TEST_SOCKS_PORT, secret);
     if let Some((username, password)) = socks_auth {
         server.set_socks_auth(username.to_string(), password.to_string());
+    }
+    if let Some(pending_request_timeout) = pending_request_timeout {
+        server.set_pending_request_timeout(pending_request_timeout);
     }
     let handle = tokio::spawn(server.listen());
     time::sleep(Duration::from_millis(50)).await;
@@ -105,13 +109,34 @@ async fn socks5_connect(
     Ok(stream)
 }
 
+async fn socks5_connect_status(proxy_addr: SocketAddr, target: SocketAddr) -> Result<[u8; 10]> {
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    match target.ip() {
+        std::net::IpAddr::V4(addr) => request.extend_from_slice(&addr.octets()),
+        std::net::IpAddr::V6(_) => return Err(anyhow!("test helper only supports IPv4")),
+    }
+    request.extend_from_slice(&target.port().to_be_bytes());
+    stream.write_all(&request).await?;
+
+    let mut response = [0u8; 10];
+    stream.read_exact(&mut response).await?;
+    Ok(response)
+}
+
 #[rstest]
 #[tokio::test]
 async fn basic_proxy(#[values(None, Some(""), Some("abc"))] secret: Option<&str>) -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(secret, None).await?);
+    tasks.push(spawn_server(secret, None, None).await?);
     tasks.push(spawn_client(secret).await?);
 
     let listener = TcpListener::bind("localhost:0").await?;
@@ -149,7 +174,7 @@ async fn mismatched_secret(
     let mut tasks = TestTasks::default();
 
     tasks.push(
-        spawn_server(server_secret, None)
+        spawn_server(server_secret, None, None)
             .await
             .expect("server should start"),
     );
@@ -161,7 +186,7 @@ async fn socks_authentication() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(None, Some(("user", "pass"))).await?);
+    tasks.push(spawn_server(None, Some(("user", "pass")), None).await?);
     tasks.push(spawn_client(None).await?);
 
     let listener = TcpListener::bind("localhost:0").await?;
@@ -190,7 +215,7 @@ async fn socks_authentication_rejects_missing_or_invalid_credentials() -> Result
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(None, Some(("user", "pass"))).await?);
+    tasks.push(spawn_server(None, Some(("user", "pass")), None).await?);
     tasks.push(spawn_client(None).await?);
 
     let mut no_auth = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, TEST_SOCKS_PORT)).await?;
@@ -238,7 +263,7 @@ async fn very_long_frame() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(None, None).await?);
+    tasks.push(spawn_server(None, None, None).await?);
     let mut attacker = TcpStream::connect(("localhost", CONTROL_PORT)).await?;
 
     for _ in 0..10 {
@@ -256,7 +281,7 @@ async fn multiple_clients_round_robin() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(None, None).await?);
+    tasks.push(spawn_server(None, None, None).await?);
     // Register two egress clients.
     tasks.push(spawn_client(None).await?);
     tasks.push(spawn_client(None).await?);
@@ -306,7 +331,7 @@ async fn half_closed_tcp_stream() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
     let mut tasks = TestTasks::default();
 
-    tasks.push(spawn_server(None, None).await?);
+    tasks.push(spawn_server(None, None, None).await?);
     tasks.push(spawn_client(None).await?);
 
     let listener = TcpListener::bind("localhost:0").await?;
@@ -328,6 +353,45 @@ async fn half_closed_tcp_stream() -> Result<()> {
     srv.write_all(&buf).await?;
     cli.read_exact(&mut buf).await?;
     assert_eq!(buf, b"hello from the other side!");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn unreachable_target_returns_socks_failure() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let mut tasks = TestTasks::default();
+
+    tasks.push(spawn_server(None, None, None).await?);
+    tasks.push(spawn_client(None).await?);
+
+    let response = socks5_connect_status(
+        ([127, 0, 0, 1], TEST_SOCKS_PORT).into(),
+        ([127, 0, 0, 1], 1).into(),
+    )
+    .await?;
+
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x01);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_waiting_for_client_times_out_with_socks_failure() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let mut tasks = TestTasks::default();
+
+    tasks.push(spawn_server(None, None, Some(Duration::from_millis(150))).await?);
+
+    let response = socks5_connect_status(
+        ([127, 0, 0, 1], TEST_SOCKS_PORT).into(),
+        ([127, 0, 0, 1], 8080).into(),
+    )
+    .await?;
+
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x01);
 
     Ok(())
 }

@@ -26,7 +26,7 @@ use crate::shared::{
 const MAX_PENDING_REQUESTS: usize = 1024;
 
 /// How long an unaccepted SOCKS5 request stays in `conns` before it is dropped.
-const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PendingConnection {
     stream: TcpStream,
@@ -72,6 +72,9 @@ pub struct Server {
     /// Queue of SOCKS5 requests waiting for a registered client.
     pending: Arc<Mutex<VecDeque<(Uuid, TargetAddr)>>>,
 
+    /// Maximum time a SOCKS5 request may wait for an egress client.
+    pending_request_timeout: Duration,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -88,6 +91,7 @@ impl Server {
             clients: Arc::new(DashMap::new()),
             rr_counter: Arc::new(AtomicUsize::new(0)),
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending_request_timeout: DEFAULT_PENDING_REQUEST_TIMEOUT,
             auth: secret.map(Authenticator::new),
             socks_auth: None,
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -103,6 +107,11 @@ impl Server {
     /// Set the IP address where the SOCKS5 proxy will listen on.
     pub fn set_bind_socks(&mut self, bind_socks: IpAddr) {
         self.bind_socks = bind_socks;
+    }
+
+    /// Set how long a SOCKS5 request may wait for an egress client.
+    pub fn set_pending_request_timeout(&mut self, pending_request_timeout: Duration) {
+        self.pending_request_timeout = pending_request_timeout;
     }
 
     /// Require username/password authentication on the public SOCKS5 listener.
@@ -131,17 +140,11 @@ impl Server {
         // returned an Accept in time.
         let janitor = Arc::clone(&this);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            let mut tick =
+                tokio::time::interval(janitor.pending_request_timeout.min(Duration::from_secs(2)));
             loop {
                 tick.tick().await;
-                let now = Instant::now();
-                janitor.conns.retain(|id, pending| {
-                    let keep = now.duration_since(pending.queued_at) < PENDING_REQUEST_TIMEOUT;
-                    if !keep {
-                        warn!(%id, "removed stale SOCKS5 request");
-                    }
-                    keep
-                });
+                janitor.expire_pending_requests().await;
             }
         });
 
@@ -240,6 +243,37 @@ impl Server {
         DispatchOutcome::Queued
     }
 
+    async fn expire_pending_requests(&self) {
+        let now = Instant::now();
+        let expired_ids: Vec<Uuid> = self
+            .conns
+            .iter()
+            .filter_map(|entry| {
+                (now.duration_since(entry.value().queued_at) >= self.pending_request_timeout)
+                    .then_some(*entry.key())
+            })
+            .collect();
+
+        if expired_ids.is_empty() {
+            return;
+        }
+
+        {
+            let mut pending = self.pending.lock().await;
+            pending.retain(|(id, _)| !expired_ids.contains(id));
+        }
+
+        for id in expired_ids {
+            match self.conns.remove(&id) {
+                Some((_, mut pending)) => {
+                    warn!(%id, "timed out waiting for an egress client");
+                    let _ = write_socks_failure_late(&mut pending.stream, 0x01).await;
+                }
+                None => warn!(%id, "stale SOCKS5 request already removed"),
+            }
+        }
+    }
+
     async fn handle_control_connection(
         &self,
         stream: TcpStream,
@@ -289,10 +323,20 @@ impl Server {
                 info!(%client_id, addr = %removed_addr, remaining = self.clients.len(), "client deregistered");
                 result?;
             }
+            Some(ClientMessage::Reject(id)) => {
+                info!(%id, "rejecting SOCKS5 connection");
+                match self.conns.remove(&id) {
+                    Some((_, mut pending)) => {
+                        let _ = write_socks_failure_late(&mut pending.stream, 0x01).await;
+                    }
+                    None => warn!(%id, "missing SOCKS5 connection"),
+                }
+            }
             Some(ClientMessage::Accept(id)) => {
                 info!(%id, "forwarding SOCKS5 connection");
                 match self.conns.remove(&id) {
                     Some((_, mut pending)) => {
+                        write_socks_reply(&mut pending.stream, 0x00).await?;
                         let mut parts = stream.into_parts();
                         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
                         pending.stream.write_all(&parts.read_buf).await?;
@@ -367,13 +411,7 @@ enum DispatchOutcome {
 /// Write a SOCKS5 failure reply on a stream where the success reply was not
 /// yet sent. This is best-effort: errors are ignored by the caller.
 async fn write_socks_failure_late(stream: &mut TcpStream, status: u8) -> Result<()> {
-    // We have already sent 0x00 success in `socks5_handshake`, so the only way
-    // the SOCKS5 client will know about this failure is by closing the
-    // connection. Sending anything here would be interpreted as tunneled data.
-    // Just drop the stream cleanly.
-    let _ = status;
-    stream.shutdown().await?;
-    Ok(())
+    write_socks_reply(stream, status).await
 }
 
 async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&SocksAuth>) -> Result<TargetAddr> {
@@ -441,7 +479,6 @@ async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&SocksAuth>) -> R
     stream.read_exact(&mut port).await?;
     let port = u16::from_be_bytes(port);
 
-    write_socks_reply(stream, 0x00).await?;
     Ok(TargetAddr { host, port })
 }
 

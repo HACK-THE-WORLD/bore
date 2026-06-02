@@ -67,6 +67,9 @@ pub enum ClientMessage {
     /// Accepts an incoming SOCKS connection, using this stream as a proxy.
     Accept(Uuid),
 
+    /// Rejects an incoming SOCKS connection because the target could not be reached.
+    Reject(Uuid),
+
     /// No-op used by the client to keep the control connection alive.
     Heartbeat,
 }

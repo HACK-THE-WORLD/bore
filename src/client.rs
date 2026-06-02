@@ -214,9 +214,15 @@ impl Client {
         if let Some(auth) = &self.auth {
             auth.client_handshake(&mut remote_conn).await?;
         }
+        let mut target_conn = match connect_tcp(&target.host, target.port).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = remote_conn.send(ClientMessage::Reject(id)).await;
+                return Err(err);
+            }
+        };
         remote_conn.send(ClientMessage::Accept(id)).await?;
 
-        let mut target_conn = connect_tcp(&target.host, target.port).await?;
         let mut parts = remote_conn.into_parts();
         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
         target_conn.write_all(&parts.read_buf).await?;
