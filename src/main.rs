@@ -57,6 +57,12 @@ enum Command {
         /// IP address where the SOCKS5 proxy will listen on, defaults to --bind-addr.
         #[clap(long)]
         bind_socks: Option<IpAddr>,
+
+        /// Targets that should bypass client egress and be connected directly
+        /// from the server. Accepts `@file`, an existing file path, or a
+        /// comma-separated wildcard list.
+        #[clap(long, env = "BORE_CLIENT_BLACKLIST")]
+        client_blacklist: Option<String>,
     },
 }
 
@@ -74,12 +80,16 @@ async fn run(command: Command) -> Result<()> {
             socks_password,
             bind_addr,
             bind_socks,
+            client_blacklist,
         } => {
             let mut server = Server::new(socks_port, secret.as_deref());
             match (socks_username, socks_password) {
                 (Some(username), Some(password)) => server.set_socks_auth(username, password),
                 (None, None) => (),
                 _ => bail!("--socks-username and --socks-password must be provided together"),
+            }
+            if let Some(client_blacklist) = client_blacklist {
+                server.set_client_blacklist_spec(&client_blacklist)?;
             }
             server.set_bind_addr(bind_addr);
             server.set_bind_socks(bind_socks.unwrap_or(bind_addr));

@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use crate::auth::Authenticator;
 use crate::shared::{
     tune_tcp_stream, ClientMessage, Delimited, ServerMessage, TargetAddr, CONTROL_PORT,
-    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
+    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, NETWORK_TIMEOUT,
 };
 
 /// Maximum number of SOCKS5 requests that can be queued while no client is
@@ -75,6 +76,10 @@ pub struct Server {
     /// Maximum time a SOCKS5 request may wait for an egress client.
     pending_request_timeout: Duration,
 
+    /// Targets that should bypass the client egress and be connected directly
+    /// from the server.
+    client_blacklist: Option<TargetBlacklist>,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -92,6 +97,7 @@ impl Server {
             rr_counter: Arc::new(AtomicUsize::new(0)),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             pending_request_timeout: DEFAULT_PENDING_REQUEST_TIMEOUT,
+            client_blacklist: None,
             auth: secret.map(Authenticator::new),
             socks_auth: None,
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -112,6 +118,16 @@ impl Server {
     /// Set how long a SOCKS5 request may wait for an egress client.
     pub fn set_pending_request_timeout(&mut self, pending_request_timeout: Duration) {
         self.pending_request_timeout = pending_request_timeout;
+    }
+
+    /// Configure targets that should bypass the client egress.
+    ///
+    /// The value may either be a comma-separated list of wildcard patterns, an
+    /// existing file path, or `@path/to/file`. File entries may be separated by
+    /// commas or newlines. Empty lines and `#` comments are ignored.
+    pub fn set_client_blacklist_spec(&mut self, spec: &str) -> Result<()> {
+        self.client_blacklist = Some(TargetBlacklist::parse(spec)?);
+        Ok(())
     }
 
     /// Require username/password authentication on the public SOCKS5 listener.
@@ -196,6 +212,15 @@ impl Server {
         };
         info!(%target.host, target.port, "new SOCKS5 request");
 
+        if self.should_bypass_client(&target) {
+            info!(%target.host, target.port, "target matched client blacklist; connecting directly from server");
+            if let Err(err) = proxy_direct_connection(&mut stream, &target).await {
+                warn!(%err, %target.host, target.port, "direct server connection failed");
+                let _ = write_socks_failure_late(&mut stream, 0x01).await;
+            }
+            return Ok(());
+        }
+
         let id = Uuid::new_v4();
         let queued_at = Instant::now();
 
@@ -215,6 +240,12 @@ impl Server {
         }
 
         Ok(())
+    }
+
+    fn should_bypass_client(&self, target: &TargetAddr) -> bool {
+        self.client_blacklist
+            .as_ref()
+            .is_some_and(|blacklist| blacklist.matches(&target.host))
     }
 
     async fn dispatch_request(&self, id: Uuid, target: TargetAddr) -> DispatchOutcome {
@@ -408,6 +439,103 @@ enum DispatchOutcome {
     Rejected,
 }
 
+#[derive(Clone, Debug)]
+struct TargetBlacklist {
+    patterns: Vec<String>,
+}
+
+impl TargetBlacklist {
+    fn parse(spec: &str) -> Result<Self> {
+        let source = read_blacklist_source(spec)?;
+        let patterns = source
+            .split([',', '\n', '\r'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty() && !entry.starts_with('#'))
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+
+        if patterns.is_empty() {
+            bail!("client blacklist did not contain any patterns");
+        }
+
+        Ok(Self { patterns })
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.patterns
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, &host))
+    }
+}
+
+fn read_blacklist_source(spec: &str) -> Result<String> {
+    if let Some(path) = spec.strip_prefix('@') {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("could not read client blacklist file {path}"));
+    }
+
+    let path = Path::new(spec);
+    if path.is_file() {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("could not read client blacklist file {}", path.display()));
+    }
+
+    Ok(spec.to_string())
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+
+    let mut pattern_idx = 0;
+    let mut value_idx = 0;
+    let mut star_idx = None;
+    let mut match_idx = 0;
+
+    while value_idx < value.len() {
+        if pattern_idx < pattern.len()
+            && (pattern[pattern_idx] == b'?' || pattern[pattern_idx] == value[value_idx])
+        {
+            pattern_idx += 1;
+            value_idx += 1;
+        } else if pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
+            star_idx = Some(pattern_idx);
+            pattern_idx += 1;
+            match_idx = value_idx;
+        } else if let Some(star_idx) = star_idx {
+            pattern_idx = star_idx + 1;
+            match_idx += 1;
+            value_idx = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
+        pattern_idx += 1;
+    }
+
+    pattern_idx == pattern.len()
+}
+
+async fn proxy_direct_connection(stream: &mut TcpStream, target: &TargetAddr) -> Result<()> {
+    let mut target_stream = connect_target(&target.host, target.port).await?;
+    write_socks_reply(stream, 0x00).await?;
+    tokio::io::copy_bidirectional(stream, &mut target_stream).await?;
+    Ok(())
+}
+
+async fn connect_target(host: &str, port: u16) -> Result<TcpStream> {
+    let stream = match timeout(NETWORK_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(res) => res,
+        Err(err) => Err(err.into()),
+    }
+    .with_context(|| format!("could not connect directly to {host}:{port}"))?;
+    tune_tcp_stream(&stream);
+    Ok(stream)
+}
+
 /// Write a SOCKS5 failure reply on a stream where the success reply was not
 /// yet sent. This is best-effort: errors are ignored by the caller.
 async fn write_socks_failure_late(stream: &mut TcpStream, status: u8) -> Result<()> {
@@ -527,4 +655,39 @@ async fn write_socks_reply(stream: &mut TcpStream, status: u8) -> Result<()> {
         .write_all(&[0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_blacklist_source, TargetBlacklist};
+    use anyhow::Result;
+
+    #[test]
+    fn blacklist_matches_wildcards_case_insensitively() {
+        let blacklist = TargetBlacklist::parse("*.example.com,10.0.*.*,LOCALHOST").unwrap();
+
+        assert!(blacklist.matches("api.example.com"));
+        assert!(blacklist.matches("10.0.8.12"));
+        assert!(blacklist.matches("localhost"));
+        assert!(blacklist.matches("LOCALHOST"));
+        assert!(!blacklist.matches("example.org"));
+    }
+
+    #[test]
+    fn blacklist_supports_file_sources() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "bore-blacklist-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "# comment\n*.corp.local\n127.0.0.1\n")?;
+
+        let source = read_blacklist_source(&format!("@{}", path.display()))?;
+        let blacklist = TargetBlacklist::parse(&format!("@{}", path.display()))?;
+        assert!(source.contains("*.corp.local"));
+        assert!(blacklist.matches("db.corp.local"));
+        assert!(blacklist.matches("127.0.0.1"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }

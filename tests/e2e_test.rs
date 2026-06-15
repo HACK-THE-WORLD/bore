@@ -42,12 +42,24 @@ async fn spawn_server(
     socks_auth: Option<(&str, &str)>,
     pending_request_timeout: Option<Duration>,
 ) -> Result<JoinHandle<Result<()>>> {
+    spawn_server_with_blacklist(secret, socks_auth, pending_request_timeout, None).await
+}
+
+async fn spawn_server_with_blacklist(
+    secret: Option<&str>,
+    socks_auth: Option<(&str, &str)>,
+    pending_request_timeout: Option<Duration>,
+    client_blacklist: Option<&str>,
+) -> Result<JoinHandle<Result<()>>> {
     let mut server = Server::new(TEST_SOCKS_PORT, secret);
     if let Some((username, password)) = socks_auth {
         server.set_socks_auth(username.to_string(), password.to_string());
     }
     if let Some(pending_request_timeout) = pending_request_timeout {
         server.set_pending_request_timeout(pending_request_timeout);
+    }
+    if let Some(client_blacklist) = client_blacklist {
+        server.set_client_blacklist_spec(client_blacklist)?;
     }
     let handle = tokio::spawn(server.listen());
     time::sleep(Duration::from_millis(50)).await;
@@ -69,6 +81,37 @@ async fn spawn_client(secret: Option<&str>) -> Result<JoinHandle<Result<()>>> {
 async fn socks5_connect(
     proxy_addr: SocketAddr,
     target: SocketAddr,
+    credentials: Option<(&str, &str)>,
+) -> Result<TcpStream> {
+    let ip = match target.ip() {
+        std::net::IpAddr::V4(addr) => addr.octets().to_vec(),
+        std::net::IpAddr::V6(_) => return Err(anyhow!("test helper only supports IPv4")),
+    };
+    socks5_connect_raw(proxy_addr, 0x01, &ip, target.port(), credentials).await
+}
+
+async fn socks5_connect_domain(
+    proxy_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    credentials: Option<(&str, &str)>,
+) -> Result<TcpStream> {
+    let host = host.as_bytes();
+    if host.len() > 255 {
+        return Err(anyhow!("test helper hostname too long"));
+    }
+
+    let mut payload = Vec::with_capacity(host.len() + 1);
+    payload.push(host.len() as u8);
+    payload.extend_from_slice(host);
+    socks5_connect_raw(proxy_addr, 0x03, &payload, port, credentials).await
+}
+
+async fn socks5_connect_raw(
+    proxy_addr: SocketAddr,
+    atyp: u8,
+    addr: &[u8],
+    port: u16,
     credentials: Option<(&str, &str)>,
 ) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -94,12 +137,9 @@ async fn socks5_connect(
         assert_eq!(auth_status, [0x01, 0x00]);
     }
 
-    let mut request = vec![0x05, 0x01, 0x00, 0x01];
-    match target.ip() {
-        std::net::IpAddr::V4(addr) => request.extend_from_slice(&addr.octets()),
-        std::net::IpAddr::V6(_) => return Err(anyhow!("test helper only supports IPv4")),
-    }
-    request.extend_from_slice(&target.port().to_be_bytes());
+    let mut request = vec![0x05, 0x01, 0x00, atyp];
+    request.extend_from_slice(addr);
+    request.extend_from_slice(&port.to_be_bytes());
     stream.write_all(&request).await?;
 
     let mut response = [0u8; 10];
@@ -392,6 +432,38 @@ async fn request_waiting_for_client_times_out_with_socks_failure() -> Result<()>
 
     assert_eq!(response[0], 0x05);
     assert_eq!(response[1], 0x01);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn blacklisted_target_bypasses_client_egress() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let mut tasks = TestTasks::default();
+
+    tasks.push(
+        spawn_server_with_blacklist(None, None, None, Some("*.corp.internal,localhost"))
+            .await?,
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        stream.write_all(b"ok").await?;
+        anyhow::Ok(())
+    });
+
+    let mut stream = socks5_connect_domain(
+        ([127, 0, 0, 1], TEST_SOCKS_PORT).into(),
+        "localhost",
+        target_addr.port(),
+        None,
+    )
+    .await?;
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await?;
+    assert_eq!(&buf, b"ok");
 
     Ok(())
 }

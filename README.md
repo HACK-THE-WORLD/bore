@@ -1,6 +1,6 @@
 # bore
 
-A reverse SOCKS5 proxy built from the original `bore` tunnel. It lets a remote server expose a SOCKS5 port while all outbound network connections are made from the client machine's network environment.
+A reverse SOCKS5 proxy built from the original `bore` tunnel. It lets a remote server expose a SOCKS5 port while outbound network connections are normally made from the client machine's network environment.
 
 This is useful when you want tools on the server side to browse through the client's network, instead of forwarding one fixed local port.
 
@@ -60,6 +60,26 @@ Supported schemes:
 
 `--proxy` only affects the client's connection to the bore server control port. Users of the remote SOCKS5 proxy still connect to `<SERVER_ADDRESS>:1080`.
 
+If some targets should stay on the server side instead of using the client egress, set `--client-blacklist` on `bore server`.
+
+Examples:
+
+```shell
+# Comma-separated wildcard patterns
+bore server --socks-port 1080 --client-blacklist "*.corp.internal,10.0.*.*,localhost"
+
+# Read patterns from a file
+bore server --socks-port 1080 --client-blacklist @./client-blacklist.txt
+```
+
+The blacklist matches the requested SOCKS5 host before dispatching to a client:
+
+- Exact IPs or hostnames such as `127.0.0.1` or `api.example.com`
+- Wildcards such as `*.example.com`, `10.0.*.*`, or `db-??.corp`
+- A comma-separated string, an existing file path, or `@path/to/file`
+
+Blacklist files may use commas or newlines between entries. Empty lines and lines starting with `#` are ignored.
+
 ## Commands
 
 ### Client
@@ -94,6 +114,8 @@ Options:
                      Optional password required by the public SOCKS5 listener [env: BORE_SOCKS_PASSWORD=]
       --bind-addr <BIND_ADDR>    IP address for the control server [default: 0.0.0.0]
       --bind-socks <BIND_SOCKS>  IP address where the SOCKS5 proxy listens, defaults to --bind-addr
+      --client-blacklist <CLIENT_BLACKLIST>
+                                 Targets that bypass client egress and are connected directly from the server [env: BORE_CLIENT_BLACKLIST=]
   -h, --help                     Print help
 ```
 
@@ -101,7 +123,7 @@ The control server listens on TCP port `7835`. The SOCKS5 proxy listens on `--so
 
 ## Protocol
 
-The client keeps a control connection to the server on port `7835`. The server exposes a SOCKS5 listener. For each SOCKS5 `CONNECT` request, the server sends the requested target host and port to the client over the control connection. The client opens a new connection back to the control server, accepts that request ID, dials the target from the client's network, and the two streams are copied bidirectionally.
+The client keeps a control connection to the server on port `7835`. The server exposes a SOCKS5 listener. For each SOCKS5 `CONNECT` request, the server either connects directly to the target itself when `--client-blacklist` matches, or sends the requested target host and port to the client over the control connection. In the client-egress case, the client opens a new connection back to the control server, accepts that request ID, dials the target from the client's network, and the two streams are copied bidirectionally.
 
 ### Multiple clients
 
