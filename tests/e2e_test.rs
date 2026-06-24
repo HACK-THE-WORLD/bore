@@ -442,8 +442,7 @@ async fn blacklisted_target_bypasses_client_egress() -> Result<()> {
     let mut tasks = TestTasks::default();
 
     tasks.push(
-        spawn_server_with_blacklist(None, None, None, Some("*.corp.internal,localhost"))
-            .await?,
+        spawn_server_with_blacklist(None, None, None, Some("*.corp.internal,localhost")).await?,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;

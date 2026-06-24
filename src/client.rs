@@ -106,6 +106,10 @@ impl ProxyConfig {
             credentials,
         })
     }
+
+    fn uses_http_connect(&self) -> bool {
+        matches!(self.scheme, ProxyScheme::Http | ProxyScheme::Https)
+    }
 }
 
 /// State structure for the client.
@@ -223,10 +227,18 @@ impl Client {
         };
         remote_conn.send(ClientMessage::Accept(id)).await?;
 
+        let close_on_eof = self
+            .proxy
+            .as_ref()
+            .map_or(false, ProxyConfig::uses_http_connect);
         let mut parts = remote_conn.into_parts();
         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
         target_conn.write_all(&parts.read_buf).await?;
-        tokio::io::copy_bidirectional(&mut target_conn, &mut parts.io).await?;
+        if close_on_eof {
+            copy_bidirectional_close_on_eof(target_conn, parts.io).await?;
+        } else {
+            tokio::io::copy_bidirectional(&mut target_conn, &mut parts.io).await?;
+        }
         Ok(())
     }
 }
@@ -263,6 +275,26 @@ pub async fn run_with_reconnect(
             }
         }
     }
+}
+
+async fn copy_bidirectional_close_on_eof(target: TcpStream, remote: RemoteStream) -> Result<()> {
+    // Some HTTP CONNECT proxies do not propagate TCP half-closes reliably. For
+    // response bodies delimited by EOF, keeping the tunnel half-open can make
+    // browsers wait forever, so close the whole data tunnel after either side
+    // reaches EOF.
+    let (mut target_read, mut target_write) = tokio::io::split(target);
+    let (mut remote_read, mut remote_write) = tokio::io::split(remote);
+
+    tokio::select! {
+        result = tokio::io::copy(&mut target_read, &mut remote_write) => {
+            result?;
+        }
+        result = tokio::io::copy(&mut remote_read, &mut target_write) => {
+            result?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn connect_tcp(to: &str, port: u16) -> Result<TcpStream> {

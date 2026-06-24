@@ -675,10 +675,7 @@ mod tests {
 
     #[test]
     fn blacklist_supports_file_sources() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "bore-blacklist-{}.txt",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("bore-blacklist-{}.txt", std::process::id()));
         std::fs::write(&path, "# comment\n*.corp.local\n127.0.0.1\n")?;
 
         let source = read_blacklist_source(&format!("@{}", path.display()))?;
