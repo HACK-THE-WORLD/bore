@@ -1,5 +1,3 @@
-//! Server implementation for the `bore` service.
-
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -121,10 +119,6 @@ impl Server {
     }
 
     /// Configure targets that should bypass the client egress.
-    ///
-    /// The value may either be a comma-separated list of wildcard patterns, an
-    /// existing file path, or `@path/to/file`. File entries may be separated by
-    /// commas or newlines. Empty lines and `#` comments are ignored.
     pub fn set_client_blacklist_spec(&mut self, spec: &str) -> Result<()> {
         self.client_blacklist = Some(TargetBlacklist::parse(spec)?);
         Ok(())

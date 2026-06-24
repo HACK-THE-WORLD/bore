@@ -59,8 +59,6 @@ enum Command {
         bind_socks: Option<IpAddr>,
 
         /// Targets that should bypass client egress and be connected directly
-        /// from the server. Accepts `@file`, an existing file path, or a
-        /// comma-separated wildcard list.
         #[clap(long, env = "BORE_CLIENT_BLACKLIST")]
         client_blacklist: Option<String>,
     },

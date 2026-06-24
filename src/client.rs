@@ -1,5 +1,3 @@
-//! Client implementation for the `bore` service.
-
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,11 +49,6 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     /// Parse a proxy URL.
-    ///
-    /// Supported schemes:
-    /// - `http://host:port` / `https://host:port`
-    /// - `socks5://[user:pass@]host:port`
-    /// - `socks5h://[user:pass@]host:port` (proxy resolves the destination DNS)
     pub fn parse(url: &str) -> Result<Self> {
         let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
             (ProxyScheme::Http, rest)

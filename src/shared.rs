@@ -1,5 +1,3 @@
-//! Shared data structures, utilities, and protocol definitions.
-
 use std::time::Duration;
 
 use anyhow::{Context, Result};

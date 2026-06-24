@@ -1,5 +1,3 @@
-//! Auth implementation for bore client and server.
-
 use anyhow::{bail, ensure, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -25,18 +23,6 @@ impl Authenticator {
         hex::encode(hmac.finalize().into_bytes())
     }
 
-    /// Validate a reply to a challenge.
-    ///
-    /// ```
-    /// use bore_cli::auth::Authenticator;
-    /// use uuid::Uuid;
-    ///
-    /// let auth = Authenticator::new("secret");
-    /// let challenge = Uuid::new_v4();
-    ///
-    /// assert!(auth.validate(&challenge, &auth.answer(&challenge)));
-    /// assert!(!auth.validate(&challenge, "wrong answer"));
-    /// ```
     pub fn validate(&self, challenge: &Uuid, tag: &str) -> bool {
         if let Ok(tag) = hex::decode(tag) {
             let mut hmac = self.0.clone();
